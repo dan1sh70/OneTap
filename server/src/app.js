@@ -14,6 +14,9 @@ const propertyRoutes = require('./routes/propertyRoutes');
 const subscriptionRoutes = require('./routes/subscriptionRoutes');
 const campaignRoutes = require('./routes/campaignRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const categoryRoutes = require('./routes/categoryRoutes');
+const reportRoutes = require('./routes/reportRoutes');
+const uploadRoutes = require('./routes/uploadRoutes');
 
 const app = express();
 
@@ -43,12 +46,15 @@ app.get('/api/health', (req, res) => {
 // Mount Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/vendors', vendorRoutes);
+app.use('/api/categories', categoryRoutes);
 app.use('/api/listings', listingRoutes);
 app.use('/api/enquiries', enquiryRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/properties', propertyRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/campaigns', campaignRoutes);
+app.use('/api/reports', reportRoutes);
+app.use('/api/upload', uploadRoutes);
 app.use('/api/admin', adminRoutes);
 
 // Global Error Handler
