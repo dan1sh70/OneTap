@@ -5,10 +5,12 @@ const Listing = require('../models/Listing');
 const Category = require('../models/Category');
 const SubscriptionPlan = require('../models/SubscriptionPlan');
 const EntitlementGrant = require('../models/EntitlementGrant');
+const BenefitRequest = require('../models/BenefitRequest');
 const PropertyCase = require('../models/PropertyCase');
 const Payment = require('../models/Payment');
 const LedgerEntry = require('../models/LedgerEntry');
 const AuditLog = require('../models/AuditLog');
+const Report = require('../models/Report');
 
 // @desc    Admin summary metrics for operational dashboard
 // @route   GET /api/admin/metrics
@@ -20,6 +22,8 @@ exports.getAdminMetrics = async (req, res) => {
     const pendingVerifications = await VerificationCase.countDocuments({ status: 'submitted' });
     const activeListings = await Listing.countDocuments({ status: 'active' });
     const pendingPropertyCases = await PropertyCase.countDocuments({ status: 'pending_assignment' });
+    const pendingBenefitRequests = await BenefitRequest.countDocuments({ status: 'pending' });
+    const pendingReports = await Report.countDocuments({ status: 'pending' });
 
     // Revenue calculation from completed vendor payments
     const revenueAgg = await Payment.aggregate([
@@ -37,9 +41,91 @@ exports.getAdminMetrics = async (req, res) => {
         pendingVerifications,
         activeListings,
         pendingPropertyCases,
+        pendingBenefitRequests,
+        pendingReports,
         totalRevenuePaise,
       },
     });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get all users with role filtering & pagination
+// @route   GET /api/admin/users
+// @access  Private (Admin)
+exports.getUsers = async (req, res) => {
+  try {
+    const { role, search, page = 1, limit = 20 } = req.query;
+    const filter = {};
+    if (role) filter.roles = role;
+    if (search) {
+      filter.$or = [
+        { fullName: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const users = await User.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit));
+    const total = await User.countDocuments(filter);
+
+    return res.status(200).json({
+      success: true,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / parseInt(limit)),
+      data: users,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Toggle user suspension
+// @route   PUT /api/admin/users/:id/suspension
+// @access  Private (Admin)
+exports.toggleUserSuspension = async (req, res) => {
+  try {
+    const { isSuspended, suspensionReason } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.isSuspended = isSuspended;
+    user.suspensionReason = suspensionReason || '';
+    await user.save();
+
+    await AuditLog.create({
+      performedByUserId: req.user._id,
+      action: isSuspended ? 'USER_SUSPENDED' : 'USER_REINSTATED',
+      resourceType: 'User',
+      resourceId: user._id,
+      details: { suspensionReason },
+    });
+
+    return res.status(200).json({ success: true, message: 'User status updated', user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get all verification cases
+// @route   GET /api/admin/verifications
+// @access  Private (Admin, Moderator)
+exports.getVerificationCases = async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+
+    const cases = await VerificationCase.find(filter)
+      .populate('vendorId')
+      .populate('reviewerId', 'fullName phone')
+      .sort({ createdAt: -1 });
+
+    return res.status(200).json({ success: true, count: cases.length, data: cases });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -62,7 +148,6 @@ exports.reviewVerificationCase = async (req, res) => {
     vCase.reviewedAt = new Date();
     await vCase.save();
 
-    // Update Vendor Profile status & specific badges per PRD Section 04
     const vendor = await VendorProfile.findById(vCase.vendorId);
     if (vendor) {
       if (status === 'approved') {
@@ -100,7 +185,71 @@ exports.reviewVerificationCase = async (req, res) => {
   }
 };
 
-// @desc    Admin grants extra benefits/slots/boosts without silently editing base plan (PRD Section 11)
+// @desc    Admin lists benefit requests from vendors
+// @route   GET /api/admin/benefit-requests
+// @access  Private (Admin)
+exports.getBenefitRequests = async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+
+    const requests = await BenefitRequest.find(filter)
+      .populate('vendorId')
+      .populate('reviewedByAdminId', 'fullName phone')
+      .sort({ createdAt: -1 });
+
+    return res.status(200).json({ success: true, count: requests.length, data: requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Admin reviews/approves/rejects benefit request and generates audited grant
+// @route   PUT /api/admin/benefit-requests/:id/review
+// @access  Private (Admin)
+exports.reviewBenefitRequest = async (req, res) => {
+  try {
+    const { status, reviewNotes, durationDays = 30 } = req.body;
+    const bRequest = await BenefitRequest.findById(req.params.id);
+    if (!bRequest) {
+      return res.status(404).json({ success: false, message: 'Benefit request not found' });
+    }
+
+    bRequest.status = status;
+    bRequest.reviewNotes = reviewNotes || '';
+    bRequest.reviewedByAdminId = req.user._id;
+    bRequest.reviewedAt = new Date();
+
+    if (status === 'approved') {
+      const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+      const grant = await EntitlementGrant.create({
+        vendorId: bRequest.vendorId,
+        grantType: bRequest.requestedByType,
+        quantity: bRequest.quantity,
+        reason: `Approved request: ${bRequest.reason}`,
+        grantedByAdminId: req.user._id,
+        expiresAt,
+        status: 'active',
+      });
+      bRequest.resultingGrantId = grant._id;
+
+      await AuditLog.create({
+        performedByUserId: req.user._id,
+        action: 'ADMIN_ENTITLEMENT_GRANTED',
+        resourceType: 'EntitlementGrant',
+        resourceId: grant._id,
+        details: { vendorId: bRequest.vendorId, grantType: bRequest.requestedByType, quantity: bRequest.quantity },
+      });
+    }
+
+    await bRequest.save();
+    return res.status(200).json({ success: true, message: `Request marked as ${status}`, bRequest });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Admin grants extra benefits directly
 // @route   POST /api/admin/entitlement-grants
 // @access  Private (Admin only)
 exports.createEntitlementGrant = async (req, res) => {
@@ -140,6 +289,25 @@ exports.createEntitlementGrant = async (req, res) => {
   }
 };
 
+// @desc    List property cases
+// @route   GET /api/admin/property-cases
+// @access  Private (Admin, Manager)
+exports.getPropertyCases = async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+
+    const cases = await PropertyCase.find(filter)
+      .populate('assignedManagerId', 'fullName phone')
+      .populate('customerId', 'fullName phone')
+      .sort({ createdAt: -1 });
+
+    return res.status(200).json({ success: true, count: cases.length, data: cases });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // @desc    Assign manager to a property case
 // @route   PUT /api/admin/property-cases/:id/assign
 // @access  Private (Admin, Manager)
@@ -164,6 +332,23 @@ exports.assignPropertyManager = async (req, res) => {
     });
 
     return res.status(200).json({ success: true, message: 'Manager assigned to property case', propertyCase });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get Financial Ledger entries (paise)
+// @route   GET /api/admin/financial-ledger
+// @access  Private (Admin, Finance)
+exports.getFinancialLedger = async (req, res) => {
+  try {
+    const ledger = await LedgerEntry.find()
+      .populate('vendorId', 'businessName businessPhone')
+      .populate('performedByAdminId', 'fullName')
+      .sort({ createdAt: -1 })
+      .limit(100);
+
+    return res.status(200).json({ success: true, count: ledger.length, data: ledger });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }

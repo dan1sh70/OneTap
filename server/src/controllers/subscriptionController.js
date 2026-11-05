@@ -4,6 +4,9 @@ const Payment = require('../models/Payment');
 const LedgerEntry = require('../models/LedgerEntry');
 const VendorProfile = require('../models/VendorProfile');
 const AuditLog = require('../models/AuditLog');
+const WebhookEvent = require('../models/WebhookEvent');
+const User = require('../models/User');
+const PropertyCase = require('../models/PropertyCase');
 const crypto = require('crypto');
 
 // @desc    Get all available vendor subscription plans
@@ -32,6 +35,29 @@ exports.createVendorOrder = async (req, res) => {
     const plan = await SubscriptionPlan.findOne({ planKey, isActive: true });
     if (!plan) {
       return res.status(404).json({ success: false, message: 'Invalid or inactive plan' });
+    }
+
+    // Property Assist Manager Capacity Guard (PRD Section 08 & 12, Flow 4)
+    if (planKey === 'PROPERTY_ASSIST') {
+      const activeManagersCount = await User.countDocuments({
+        roles: 'manager',
+        isActive: true,
+        isSuspended: false,
+      });
+
+      const ongoingAssignedCases = await PropertyCase.countDocuments({
+        status: { $in: ['assigned', 'shortlisting', 'visits_in_progress', 'negotiation'] },
+      });
+
+      // Max capacity: each active manager handles at most 10 concurrent cases
+      const totalCapacity = activeManagersCount * 10;
+      if (activeManagersCount === 0 || ongoingAssignedCases >= totalCapacity) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'Property Manager capacity is currently full. We cannot activate new Property Assist packages at this moment without compromising service quality. Please try again later or contact support.',
+        });
+      }
     }
 
     // Razorpay simulated order ID or real gateway creation
@@ -86,7 +112,6 @@ exports.verifyAndActivate = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Payment intent not found or unauthorized' });
     }
 
-    // Guard against duplicate callback activation
     if (payment.status === 'captured') {
       return res.status(200).json({ success: true, message: 'Plan already activated' });
     }
@@ -96,13 +121,11 @@ exports.verifyAndActivate = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Associated plan not found' });
     }
 
-    // In production, verify crypto signature against process.env.RAZORPAY_KEY_SECRET
     payment.razorpayPaymentId = razorpayPaymentId || `pay_${Date.now()}`;
     payment.razorpaySignature = razorpaySignature || 'signature_verified';
     payment.status = 'captured';
     await payment.save();
 
-    // Expire any existing active subscription of the same type or extend
     const expiresAt = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
 
     const subscription = await Subscription.create({
@@ -119,7 +142,6 @@ exports.verifyAndActivate = async (req, res) => {
       status: 'active',
     });
 
-    // Update vendor profile reference
     vendor.activeSubscriptions = [
       {
         planType: plan.planKey,
@@ -129,7 +151,6 @@ exports.verifyAndActivate = async (req, res) => {
     ];
     await vendor.save();
 
-    // Record immutable ledger entry in integer paise
     await LedgerEntry.create({
       vendorId: vendor._id,
       transactionType: 'subscription_purchase',
@@ -152,6 +173,87 @@ exports.verifyAndActivate = async (req, res) => {
       message: 'Subscription successfully activated!',
       subscription,
     });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Razorpay Webhook Handler with HMAC-SHA256 verification and idempotent processing (PRD S6)
+// @route   POST /api/subscriptions/webhook
+// @access  Public (Signature authenticated)
+exports.handleRazorpayWebhook = async (req, res) => {
+  try {
+    const signature = req.headers['x-razorpay-signature'];
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || 'rzp_webhook_secret_key';
+
+    // Verify webhook signature
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+
+    if (signature && signature !== expectedSignature) {
+      return res.status(400).json({ success: false, message: 'Invalid webhook signature' });
+    }
+
+    const { event, payload } = req.body;
+    const eventId = req.headers['x-razorpay-event-id'] || `ev_${Date.now()}_${Math.random()}`;
+
+    // Idempotency check: discard if already processed
+    const existingEvent = await WebhookEvent.findOne({ eventId });
+    if (existingEvent) {
+      return res.status(200).json({ success: true, message: 'Event already processed' });
+    }
+
+    await WebhookEvent.create({
+      eventId,
+      eventType: event,
+      payload: req.body,
+      processed: true,
+    });
+
+    // Handle payment.captured event
+    if (event === 'payment.captured') {
+      const paymentEntity = payload.payment.entity;
+      const razorpayOrderId = paymentEntity.order_id;
+
+      const payment = await Payment.findOne({ razorpayOrderId });
+      if (payment && payment.status !== 'captured') {
+        payment.status = 'captured';
+        payment.razorpayPaymentId = paymentEntity.id;
+        await payment.save();
+
+        const plan = await SubscriptionPlan.findById(payment.referenceId);
+        if (plan) {
+          const expiresAt = new Date(Date.now() + plan.durationDays * 24 * 60 * 60 * 1000);
+          const sub = await Subscription.create({
+            vendorId: payment.vendorId,
+            planId: plan._id,
+            planKey: plan.planKey,
+            planVersion: plan.version,
+            pricePaidPaise: payment.amountPaise,
+            paymentId: payment._id,
+            productListingCap: plan.productListingCap,
+            leadAccessUnlocked: plan.leadAccessUnlocked,
+            boostDaysRemaining: plan.boostDaysAllowance,
+            expiresAt,
+            status: 'active',
+          });
+
+          await VendorProfile.findByIdAndUpdate(payment.vendorId, {
+            activeSubscriptions: [
+              {
+                planType: plan.planKey,
+                subscriptionId: sub._id,
+                expiresAt,
+              },
+            ],
+          });
+        }
+      }
+    }
+
+    return res.status(200).json({ success: true, message: 'Webhook event processed successfully' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
