@@ -7,3 +7,4 @@ router.post('/favorites/toggle', protect, toggleFavorite);
 router.get('/favorites', protect, getFavorites);
 
 module.exports = router;
+

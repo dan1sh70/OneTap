@@ -98,3 +98,4 @@ const PropertyCases = () => {
 };
 
 export default PropertyCases;
+

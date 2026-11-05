@@ -47,3 +47,4 @@ const benefitRequestSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model('BenefitRequest', benefitRequestSchema);
+
